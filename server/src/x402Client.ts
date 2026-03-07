@@ -248,6 +248,11 @@ export async function createPaidPriceAlert(payload: PriceAlertPayload): Promise<
   if (!data.alert) {
     throw new Error("Invalid response from alerts API: missing alert data");
   }
+console.log(
+  'CRE_ETH_PRIVATE_KEY:',
+  process.env.CRE_ETH_PRIVATE_KEY,
+  process.env.CRE_ETH_PRIVATE_KEY?.length
+);
 
   return {
     alert: data.alert,

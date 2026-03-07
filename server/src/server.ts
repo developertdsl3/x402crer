@@ -1,5 +1,10 @@
 import dotenv from "dotenv";
 import path from "path";
+import 'dotenv/config';
+// OR
+// import dotenv from 'dotenv';
+// dotenv.config();
+
 
 // Load .env from project root
 const projectRoot = path.resolve(__dirname, "../..");
@@ -11,8 +16,7 @@ import { createHash } from "node:crypto";
 import { paymentMiddleware } from "x402-express";
 import { settleResponseFromHeader } from "x402/types";
 import { exact } from "x402/schemes";
-import OpenAI from "openai";
-import { createPaidPriceAlert } from "./x402Client";
+import { GoogleGenerativeAI } from "@google/generative-ai";
 import { startChatInterface } from "./chat";
 
 /**
@@ -27,7 +31,7 @@ import { startChatInterface } from "./chat";
  * - /chat: Natural language interface for creating alerts (no payment required)
  *   - Uses Gemini AI to extract alert parameters from user messages
  *   - Validates that only supported assets (BTC, ETH, LINK) are requested
- *   - Internally calls /alerts endpoint with x402 payment
+ *   - Returns alert payload and instructions for the agent to pay via Agentic Wallet (POST /alerts with x402)
  *
  * - /alerts: Direct alert creation endpoint (requires x402 payment)
  *   - Protected by x402 payment middleware ($0.01 USDC)
@@ -64,12 +68,12 @@ if (!process.env.X402_RECEIVER_ADDRESS) {
 
 /**
  * Gemini client for natural language processing
- * Uses OpenAI SDK with Gemini's OpenAI compatibility endpoint
+ * Uses Google's native Generative AI SDK
  */
-const llmClient = new OpenAI({
-  apiKey: process.env.GEMINI_API_KEY,
-  baseURL: "https://generativelanguage.googleapis.com/v1beta/openai/",
-});
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || "");
+// Try gemini-2.5-flash which might have better availability/rate limits
+const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+
 
 /**
  * Server port (default: 3000)
@@ -85,6 +89,22 @@ const payToAddress = process.env.X402_RECEIVER_ADDRESS as `0x${string}`;
  * x402 facilitator URL
  */
 const facilitatorUrl = (process.env.X402_FACILITATOR_URL ?? "https://x402.org/facilitator") as `${string}://${string}`;
+
+/**
+ * Public base URL of this server (for agent to call /alerts with x402).
+ * Use SERVER_BASE_URL in .env for production (e.g. https://your-domain.com).
+ */
+const SERVER_BASE_URL = process.env.SERVER_BASE_URL ?? `http://localhost:${PORT}`;
+
+/**
+ * Optional deployed CRE HTTP trigger endpoint for fully automated flow.
+ *
+ * When set, POST /alerts will automatically forward the created alert payload
+ * to this URL so no manual CRE CLI paste step is required.
+ */
+const CRE_HTTP_TRIGGER_URL = process.env.CRE_HTTP_TRIGGER_URL;
+const CRE_HTTP_TRIGGER_AUTH_BEARER = process.env.CRE_HTTP_TRIGGER_AUTH_BEARER;
+const CRE_HTTP_TRIGGER_WORKFLOW_ID = process.env.CRE_HTTP_TRIGGER_WORKFLOW_ID;
 
 /**
  * Supported cryptocurrency assets for price alerts
@@ -253,6 +273,75 @@ interface StoredAlert extends AlertRequestBody {
   createdAt: number;
 }
 
+interface CreTriggerResult {
+  enabled: boolean;
+  attempted: boolean;
+  success: boolean;
+  statusCode?: number;
+  error?: string;
+}
+
+async function triggerCreHttpWorkflow(payload: {
+  id: string;
+  asset: string;
+  condition: AlertCondition;
+  targetPriceUsd: number;
+  createdAt: number;
+}): Promise<CreTriggerResult> {
+  if (!CRE_HTTP_TRIGGER_URL) {
+    return { enabled: false, attempted: false, success: false };
+  }
+
+  try {
+    const targetUrl = new URL(CRE_HTTP_TRIGGER_URL);
+    if (CRE_HTTP_TRIGGER_WORKFLOW_ID && !targetUrl.searchParams.get("workflowID")) {
+      targetUrl.searchParams.set("workflowID", CRE_HTTP_TRIGGER_WORKFLOW_ID);
+    }
+
+    // Local cre-http-trigger expects {"input": {...}}.
+    // For generic webhooks, raw payload may be preferred; keep local mode opt-in via workflow ID.
+    const requestBody = CRE_HTTP_TRIGGER_WORKFLOW_ID ? { input: payload } : payload;
+
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+    };
+    if (CRE_HTTP_TRIGGER_AUTH_BEARER) {
+      headers.Authorization = `Bearer ${CRE_HTTP_TRIGGER_AUTH_BEARER}`;
+    }
+
+    const response = await fetch(targetUrl.toString(), {
+      method: "POST",
+      headers,
+      body: JSON.stringify(requestBody),
+    });
+
+    if (!response.ok) {
+      const body = await response.text().catch(() => "");
+      return {
+        enabled: true,
+        attempted: true,
+        success: false,
+        statusCode: response.status,
+        error: body || `CRE trigger failed with status ${response.status}`,
+      };
+    }
+
+    return {
+      enabled: true,
+      attempted: true,
+      success: true,
+      statusCode: response.status,
+    };
+  } catch (error: any) {
+    return {
+      enabled: true,
+      attempted: true,
+      success: false,
+      error: error?.message ?? "Unknown CRE trigger error",
+    };
+  }
+}
+
 // ============================================================================
 // API Endpoints
 // ============================================================================
@@ -311,29 +400,12 @@ app.post("/chat", async (req, res) => {
      * - Call the create_price_alert function only for valid requests
      */
     console.log("  [1] Extracting alert parameters with Gemini...");
-    const response = await llmClient.chat.completions.create({
-      model: "gemini-2.0-flash-lite",
-      messages: [
-        {
-          role: "system",
-          content: `You are a helpful assistant that creates crypto price alerts. 
-
-IMPORTANT RULES:
-- You can ONLY create alerts for these supported assets: ${ALLOWED_ASSETS.join(", ")}
-- If a user requests an alert for ANY other asset (like SOL, DOGE, ADA, XRP, etc.), you MUST respond with a text message explaining that only ${ALLOWED_ASSETS.join(
-            ", "
-          )} are supported
-- DO NOT call the create_price_alert function if the user requests an unsupported asset
-- Only call the create_price_alert function when the user requests an alert for one of the supported assets: ${ALLOWED_ASSETS.join(
-            ", "
-          )}`,
-        },
-        { role: "user", content: message },
-      ],
-      tools: [
-        {
-          type: "function",
-          function: {
+    
+    // Convert to Gemini's function calling format
+    const tools: any = [
+      {
+        functionDeclarations: [
+          {
             name: "create_price_alert",
             description: `Create a price alert. ONLY use this function for supported assets: ${ALLOWED_ASSETS.join(
               ", "
@@ -360,16 +432,99 @@ IMPORTANT RULES:
               required: ["asset", "condition", "targetPriceUsd"],
             },
           },
-        },
-      ],
-      // Note: tool_choice is intentionally not set to "required"
-      // This allows Gemini to respond with text when unsupported assets are requested,
-      // rather than forcing a function call that would fail validation
-    });
+        ],
+      },
+    ];
 
-    const responseMessage = response.choices[0]?.message;
+    const systemInstruction = `You are a helpful assistant that creates crypto price alerts. 
 
-    if (!responseMessage) {
+IMPORTANT RULES:
+- You can ONLY create alerts for these supported assets: ${ALLOWED_ASSETS.join(", ")}
+- If a user requests an alert for ANY other asset (like SOL, DOGE, ADA, XRP, etc.), you MUST respond with a text message explaining that only ${ALLOWED_ASSETS.join(
+      ", "
+    )} are supported
+- DO NOT call the create_price_alert function if the user requests an unsupported asset
+- Only call the create_price_alert function when the user requests an alert for one of the supported assets: ${ALLOWED_ASSETS.join(
+      ", "
+    )}`;
+
+    // Retry logic for rate limits with exponential backoff
+    // Note: Gemini API free tier has strict rate limits (typically 15 requests/minute)
+    // Rate limits can be IP-based, not just API key-based
+    let result;
+    let lastError;
+    const maxRetries = 1; // Only 1 retry to avoid making things worse
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        if (attempt > 0) {
+          console.log(`  [ATTEMPT] Retry ${attempt}/${maxRetries}...`);
+        }
+        // Use generateContent - system instruction must be passed as a parameter, not in contents
+        // Gemini only accepts "user" and "model" roles in contents array
+        result = await model.generateContent({
+          contents: [
+            { role: "user", parts: [{ text: message }] }
+          ],
+          systemInstruction: systemInstruction, // Pass as separate parameter
+          tools: tools as any,
+        });
+        break; // Success, exit retry loop
+      } catch (error: any) {
+        lastError = error;
+        
+        // Log detailed error information for debugging
+        console.log(`  [DEBUG] Error details:`);
+        console.log(`    Status: ${error.status || error.statusCode || 'N/A'}`);
+        console.log(`    Message: ${error.message || 'N/A'}`);
+        if (error.response) {
+          console.log(`    Response status: ${error.response.status}`);
+          if (error.response.data) {
+            console.log(`    Response data: ${JSON.stringify(error.response.data, null, 2)}`);
+          }
+        }
+        
+        // Check if it's a rate limit error (429)
+        if (error.status === 429 || error.statusCode === 429 || error.message?.includes("429") || error.message?.includes("rate limit") || error.message?.includes("TooManyRequests") || error.message?.includes("Quota exceeded")) {
+          // Extract retry delay from error message if available
+          let waitTime = 60000; // Default 60 seconds
+          const retryMatch = error.message?.match(/Please retry in ([\d.]+)s/);
+          if (retryMatch) {
+            waitTime = Math.ceil(parseFloat(retryMatch[1])) * 1000;
+            console.log(`  [INFO] API suggests waiting ${waitTime/1000}s`);
+          }
+          
+          // Free tier limit is 5 requests/minute per model
+          if (error.message?.includes("limit: 5")) {
+            console.log(`  [INFO] Free tier limit: 5 requests/minute per model`);
+          }
+          
+          if (attempt < maxRetries) {
+            console.log(`  [RATE LIMIT] Waiting ${waitTime/1000}s for rate limit to reset (attempt ${attempt + 1}/${maxRetries + 1})...`);
+            await new Promise(resolve => setTimeout(resolve, waitTime));
+            continue;
+          } else {
+            // After max retries, provide helpful message
+            console.log("  [INFO] Rate limit persists after retries.");
+            console.log("  [INFO] Gemini API free tier allows 5 requests/minute per model.");
+            console.log("  [INFO] Please wait before trying again.");
+            throw error;
+          }
+        }
+        throw error; // Re-throw if not rate limit or max retries reached
+      }
+    }
+    
+    if (!result) {
+      throw lastError || new Error("Failed to get response from Gemini");
+    }
+    
+    const response = result.response;
+    
+    // Check if there's a function call
+    const functionCalls = response.functionCalls() || [];
+    const textResponse = response.text();
+
+    if (!response) {
       console.log("  [ERROR] No response from Gemini");
       return res.status(500).json({ error: "No response from Gemini" });
     }
@@ -382,10 +537,10 @@ IMPORTANT RULES:
      * - User's message is unclear or not a valid alert request
      * - User asks a question or makes a general inquiry
      */
-    if (responseMessage.content && (!responseMessage.tool_calls || responseMessage.tool_calls.length === 0)) {
-      console.log(`  [REPLY] "${responseMessage.content}"`);
+    if (functionCalls.length === 0 && textResponse) {
+      console.log(`  [REPLY] "${textResponse}"`);
       console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
-      return res.json({ reply: responseMessage.content });
+      return res.json({ reply: textResponse });
     }
 
     /**
@@ -396,20 +551,18 @@ IMPORTANT RULES:
      * 2. Validate the parameters match our constraints
      * 3. Create the alert via x402 payment
      */
-    if (responseMessage.tool_calls && responseMessage.tool_calls[0]?.function?.name === "create_price_alert") {
+    if (functionCalls.length > 0 && functionCalls[0].name === "create_price_alert") {
       /**
        * Parse function arguments from Gemini's function call
        *
-       * Gemini returns function arguments as a JSON string that needs to be parsed.
+       * Gemini returns function arguments as an object.
        * The arguments should contain: asset, condition, and targetPriceUsd.
        */
-      let args;
-      try {
-        args = JSON.parse(responseMessage.tool_calls[0].function.arguments);
-      } catch (parseError) {
-        console.log("  [ERROR] Failed to parse function arguments");
-        return res.status(500).json({ error: "Failed to parse function arguments" });
-      }
+      const args = functionCalls[0].args as {
+        asset: string;
+        condition: string;
+        targetPriceUsd: number;
+      };
 
       /**
        * Validate extracted parameters
@@ -417,12 +570,12 @@ IMPORTANT RULES:
        * Even though Gemini's function definition includes enum constraints,
        * we perform additional validation as a security measure.
        */
-      if (!ALLOWED_ASSETS.includes(args.asset)) {
+      if (!ALLOWED_ASSETS.includes(args.asset as typeof ALLOWED_ASSETS[number])) {
         return res.status(400).json({
           error: `Asset "${args.asset}" is not supported. Only ${ALLOWED_ASSETS.join(", ")} are allowed.`,
         });
       }
-      if (!ALLOWED_CONDITIONS.includes(args.condition)) {
+      if (!ALLOWED_CONDITIONS.includes(args.condition as typeof ALLOWED_CONDITIONS[number])) {
         return res.status(400).json({
           error: `Invalid condition "${args.condition}". Must be one of: ${ALLOWED_CONDITIONS.join(", ")}`,
         });
@@ -436,34 +589,31 @@ IMPORTANT RULES:
       console.log(`  [2] Parameters: ${args.asset} ${args.condition} $${args.targetPriceUsd}`);
 
       /**
-       * Step 2: Create paid alert via internal /alerts endpoint
+       * Agent pays via Agentic Wallet (x402).
        *
-       * This makes an HTTP request to the /alerts endpoint, which triggers
-       * the x402 payment flow. The x402Client handles the payment automatically.
+       * We do NOT call createPaidPriceAlert() (server key). We return the alert
+       * payload and the /alerts URL so the agent can use pay-for-service (Agentic
+       * Wallet) to POST with x402 payment.
        */
-      console.log("  [3] Creating alert via /alerts endpoint (x402 payment)...");
-      try {
-        const result = await createPaidPriceAlert({
-          asset: args.asset,
-          condition: args.condition,
-          targetPriceUsd: args.targetPriceUsd,
-        });
-        console.log(`  [SUCCESS] Alert created - ID: ${result.alert.id}`);
-        console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+      const alertPayload = {
+        asset: args.asset as typeof ALLOWED_ASSETS[number],
+        condition: args.condition as typeof ALLOWED_CONDITIONS[number],
+        targetPriceUsd: args.targetPriceUsd,
+      };
+      // Build URL safely so trailing slash in SERVER_BASE_URL doesn't create //alerts
+      const alertsUrl = new URL("/alerts", SERVER_BASE_URL).toString();
 
-        return res.json({
-          reply: `Price alert created: ${args.asset} ${args.condition} $${args.targetPriceUsd}`,
-          alert: result.alert,
-          transactionHash: result.transactionHash,
-        });
-      } catch (paymentError: any) {
-        console.log(`  [ERROR] Payment failed: ${paymentError.message}`);
-        console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
-        return res.status(500).json({
-          error: "Failed to create price alert",
-          details: paymentError.message,
-        });
-      }
+      console.log("  [3] Returning payload for agent to pay via Agentic Wallet (POST /alerts with x402)");
+      console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+
+      return res.json({
+        reply: `To create this alert, use your Agentic Wallet to pay for the API. POST the payload below to ${alertsUrl} with x402 payment ($0.01 USDC). Use the pay-for-service skill.`,
+        paymentByAgent: true,
+        alertsUrl,
+        alertPayload,
+        paymentAmountUsd: 0.01,
+        instructions: "Use Agentic Wallet pay-for-service skill to POST alertPayload to alertsUrl with x402 payment.",
+      });
     } else {
       /**
        * Fallback: Text response from Gemini
@@ -471,8 +621,8 @@ IMPORTANT RULES:
        * This handles cases where Gemini returns a response but it doesn't
        * match our expected patterns (no function call, no content, etc.)
        */
-      const textReply = responseMessage.content
-        ? responseMessage.content
+      const textReply = textResponse
+        ? textResponse
         : "I can help you create price alerts for BTC, ETH, or LINK. Try saying something like 'Create an alert when BTC is greater than 50000'.";
       console.log(`  [REPLY] "${textReply}"`);
       console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
@@ -543,7 +693,7 @@ IMPORTANT RULES:
  * @body {number} targetPriceUsd - Target price in USD
  * @returns {Object} Created alert with ID and metadata
  */
-app.post("/alerts", (req, res) => {
+app.post("/alerts", async (req, res) => {
   console.log("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
   console.log("POST /alerts");
 
@@ -630,19 +780,21 @@ app.post("/alerts", (req, res) => {
     createdAt: alert.createdAt,
   };
 
-  console.log("  [3] CRE payload ready (copy for HTTP trigger):\n");
+  console.log("  [3] CRE payload ready:\n");
   console.log(JSON.stringify(workflowPayload));
+  const creTrigger = await triggerCreHttpWorkflow(workflowPayload);
+  if (creTrigger.enabled) {
+    if (creTrigger.success) {
+      console.log("  [4] CRE HTTP trigger sent successfully");
+    } else {
+      console.log(`  [4] CRE HTTP trigger failed: ${creTrigger.error ?? "Unknown error"}`);
+    }
+  } else {
+    console.log("  [4] CRE HTTP trigger not configured (set CRE_HTTP_TRIGGER_URL for full automation)");
+  }
   console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
 
-  res.status(201).json({ alert });
-
-  // Call the HTTP Trigger of the CRE Workflow
-  // TODO(dev): Implement HTTP Trigger Call (for deployed workflows only)
-  //          See: https://docs.chain.link/cre/guides/workflow/using-triggers/http-trigger/overview-ts
-  // This demo assumes you will be using local simulation.
-  // Copy the workflowPayload JSON output and paste it into the HTTP Trigger during CRE CLI Simulation.
-  // See README for simulation steps.
-  
+  res.status(201).json({ alert, creTrigger });
 });
 
 // ============================================================================
